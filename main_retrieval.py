@@ -303,10 +303,10 @@ def _run_on_single_gpu(model, batch_s_feat, batch_w_feat, batch_w_mask, batch_s_
 
     # not all features will be used for retrieval
     with torch.no_grad():
-        for idx1, (s_feat, w_feat, w_mask) in tqdm(enumerate(zip(batch_s_feat, batch_w_feat, batch_w_mask))):
+        for idx1, (s_feat, w_feat) in tqdm(enumerate(zip(batch_s_feat, batch_w_feat))):
             each_row = []
             for idx2, (f_feat, p_feat) in enumerate(zip(batch_f_feat, batch_p_feat)):
-                logits = model.get_similarity_logits(s_feat, w_feat, w_mask, f_feat, p_feat)
+                logits = model.get_similarity_logits(s_feat, w_feat, f_feat, p_feat)
                 logits = logits.cpu().detach().numpy()
                 each_row.append(logits)
             each_row = np.concatenate(tuple(each_row), axis=-1)
