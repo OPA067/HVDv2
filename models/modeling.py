@@ -213,7 +213,7 @@ class Model(nn.Module):
         sims_cf = torch.einsum("acd,bfd->abc", [s_feat_l, f_feat_l]).diagonal(dim1=0, dim2=1).transpose(0, 1)
         _, c_max_idx = torch.topk(sims_cf, k=self.l_max_sentence, dim=-1, largest=True)
         s_feat_l = s_feat_l[torch.arange(a)[:, None], c_max_idx, :].reshape(a, -1, d) # [a, c, d]
-        w_feat_l = w_feat_l[torch.arange(a)[:, None], c_max_idx, :, :] # [a, w, d]
+        w_feat_l = w_feat_l[torch.arange(a)[:, None], c_max_idx, :, :].reshape(a, -1, d) # [a, w, d]
         sims_sf_l = self.s_and_f(s_feat_l, f_feat_l, type="sf_l")
         loss_sf_l = (self.loss_fct(sims_sf_l * logit_scale) + self.loss_fct(sims_sf_l.T * logit_scale)) / 2.0
         sims_wp_l = self.w_and_p(w_feat_l, p_feat_l, type="wp_l")
