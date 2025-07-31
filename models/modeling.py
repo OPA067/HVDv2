@@ -5,6 +5,7 @@ import torch
 from torch import nn
 
 from .cluster import Att_Block_Patch, PCM
+from .module_CAttention import CAM
 from .module_clip import CLIP, convert_weights, _PT_NAME
 from .module_cross import Transformer as TransformerClip
 from .until_module import LayerNorm, AllGather, AllGather2, CrossEn, KL
@@ -105,6 +106,10 @@ class Model(nn.Module):
         self.h_max_frames, self.l_max_sentence = self.max_frames // 2, self.max_frames // 4
         self.alpha, self.beta = self.config.alpha, self.config.beta
 
+        self.cam_sf_h = CAM(embed_dim=embed_dim, dropout=0.3)
+        self.cam_sf_l = CAM(embed_dim=embed_dim, dropout=0.3)
+        self.cam_sf = CAM(embed_dim=embed_dim, dropout=0.3)
+
         sr_p = [0.5, 0.5, 0.5]
         self.v_pcm_p_1 = PCM(sample_ratio=sr_p[0], embed_dim=embed_dim, dim_out=embed_dim, k=3)
         self.v_att_block_p_1 = Att_Block_Patch(dim=embed_dim, num_heads=8)
@@ -112,8 +117,10 @@ class Model(nn.Module):
         self.v_att_block_p_2 = Att_Block_Patch(dim=embed_dim, num_heads=8)
         self.v_pcm_p_3 = PCM(sample_ratio=sr_p[2], embed_dim=embed_dim, dim_out=embed_dim, k=3)
         self.v_att_block_p_3 = Att_Block_Patch(dim=embed_dim, num_heads=8)
-        self.sf_s_feat_w = nn.Sequential(nn.Linear(embed_dim, embed_dim * 2), nn.ReLU(), nn.Linear(embed_dim * 2, 1), )
-        self.sf_f_feat_w = nn.Sequential(nn.Linear(embed_dim, embed_dim * 2), nn.ReLU(), nn.Linear(embed_dim * 2, 1), )
+        self.wp_w_feat_w_h = nn.Sequential(nn.Linear(embed_dim, embed_dim * 2), nn.ReLU(), nn.Linear(embed_dim * 2, 1), )
+        self.wp_p_feat_w_h = nn.Sequential(nn.Linear(embed_dim, embed_dim * 2), nn.ReLU(), nn.Linear(embed_dim * 2, 1), )
+        self.wp_w_feat_w_l = nn.Sequential(nn.Linear(embed_dim, embed_dim * 2), nn.ReLU(), nn.Linear(embed_dim * 2, 1), )
+        self.wp_p_feat_w_l = nn.Sequential(nn.Linear(embed_dim, embed_dim * 2), nn.ReLU(), nn.Linear(embed_dim * 2, 1), )
         self.wp_w_feat_w = nn.Sequential(nn.Linear(embed_dim, embed_dim * 2), nn.ReLU(), nn.Linear(embed_dim * 2, 1), )
         self.wp_p_feat_w = nn.Sequential(nn.Linear(embed_dim, embed_dim * 2), nn.ReLU(), nn.Linear(embed_dim * 2, 1), )
 
@@ -154,28 +161,21 @@ class Model(nn.Module):
             video = video.view(b * pair * bs * ts, channel, h, w)
 
         s_feat, w_feat = self.get_text_feat(text, text_mask)
-        s_feat_list, w_feat_list = map(list, zip(*[
-            self.get_text_feat(text, text_mask)
-            for text, text_mask in zip(text_list, text_mask_list)
-        ]))
+        s_feat_list, w_feat_list = [self.get_text_feat(text, text_mask) for text, text_mask in zip(text_list, text_mask_list)]
         f_feat, p_feat = self.get_video_feat(video, video_mask)
 
         s_feat_h = s_feat.contiguous()  # [a, d]
         w_feat_h = w_feat.contiguous()  # [a, w, d]
-        w_mask_h = text_mask.contiguous() # [a, w]
         s_feat_l = torch.stack(s_feat_list, dim=1).contiguous()  # [a, c, d]
         w_feat_l = torch.stack(w_feat_list, dim=1).contiguous()  # [a, c, w, d]
-        w_mask_l = torch.stack(text_mask_list, dim=1).contiguous() # [a, c, w]
         f_feat = f_feat.contiguous()  # [b, f, d]
         p_feat = p_feat.contiguous()  # [b, p, d]
 
         if self.training:
             s_feat_h = allgather(s_feat_h, self.config)
             w_feat_h = allgather(w_feat_h, self.config)
-            w_mask_h = allgather(w_mask_h, self.config)
             s_feat_l = allgather(s_feat_l, self.config)
             w_feat_l = allgather(w_feat_l, self.config)
-            w_mask_l = allgather(w_mask_l, self.config)
             f_feat = allgather(f_feat, self.config)
             p_feat = allgather(p_feat, self.config)
             torch.distributed.barrier()
@@ -193,47 +193,51 @@ class Model(nn.Module):
         _, f_min_idx = torch.topk(sims_sf, k=self.h_max_frames, dim=-1, largest=False)
         f_max_idx, _ = torch.sort(f_max_idx, dim=-1)
         f_min_idx, _ = torch.sort(f_min_idx, dim=-1)
-        f_feat_h = f_feat[torch.arange(b)[:, None], f_max_idx, :] # update f_feat to f_feat_h
-        sims_sf_h = self.s_and_f(s_feat_h, f_feat_h)
+        f_feat_h = f_feat[torch.arange(b)[:, None], f_max_idx, :]
+        sims_sf_h = self.s_and_f(s_feat_h, f_feat_h, type="sf_h")
         loss_sf_h = (self.loss_fct(sims_sf_h * logit_scale) + self.loss_fct(sims_sf_h.T * logit_scale)) / 2.0
 
         p_feat_ = p_feat.reshape(b, f, -1, d)
         p_feat_h = p_feat_[torch.arange(b)[:, None], f_max_idx, :, :]
         p_feat_h = p_feat_h.reshape(b, -1, d)
-        p_feat_h = self.get_less_patch_feat(p_feat_h) # update p_feat to p_feat_h
-        sims_wp_h = self.w_and_p(w_feat_h, p_feat_h)
+        p_feat_h = self.get_less_patch_feat(p_feat_h)
+        sims_wp_h = self.w_and_p(w_feat_h, p_feat_h, type="wp_h")
         loss_wp_h = (self.loss_fct(sims_wp_h * logit_scale) + self.loss_fct(sims_wp_h.T * logit_scale)) / 2.0
+        loss_self_kl_h = (self.loss_kl(sims_sf_h, sims_wp_h) + self.loss_kl(sims_sf_h, sims_wp_h.T)) / 2.0
 
         ########## Step-II: See low ##########
-        f_feat_l = f_feat[torch.arange(b)[:, None], f_min_idx, :] # update f_feat to f_feat_l
+        f_feat_l = f_feat[torch.arange(b)[:, None], f_min_idx, :]
         p_feat_l = p_feat_[torch.arange(b)[:, None], f_min_idx, :, :]
         p_feat_l = p_feat_l.reshape(b, -1, d)
-        p_feat_l = self.get_less_patch_feat(p_feat_l) # update p_feat to p_feat_l
+        p_feat_l = self.get_less_patch_feat(p_feat_l)
         sims_cf = torch.einsum("acd,bfd->abc", [s_feat_l, f_feat_l]).diagonal(dim1=0, dim2=1).transpose(0, 1)
         _, c_max_idx = torch.topk(sims_cf, k=self.l_max_sentence, dim=-1, largest=True)
-        s_feat_l = s_feat_l[torch.arange(a)[:, None], c_max_idx, :]
-        s_feat_l = torch.mean(s_feat_l, dim=1)
-        w_feat_l = w_feat_l[torch.arange(a)[:, None], c_max_idx, :, :]
-        w_feat_l = torch.mean(w_feat_l, dim=1)
-        sims_sf_l = self.s_and_f(s_feat_l, f_feat_l)
+        s_feat_l = s_feat_l[torch.arange(a)[:, None], c_max_idx, :].reshape(a, -1, d) # [a, c, d]
+        w_feat_l = w_feat_l[torch.arange(a)[:, None], c_max_idx, :, :] # [a, w, d]
+        sims_sf_l = self.s_and_f(s_feat_l, f_feat_l, type="sf_l")
         loss_sf_l = (self.loss_fct(sims_sf_l * logit_scale) + self.loss_fct(sims_sf_l.T * logit_scale)) / 2.0
-        sims_wp_l = self.w_and_p(w_feat_l, p_feat_l)
+        sims_wp_l = self.w_and_p(w_feat_l, p_feat_l, type="wp_l")
         loss_wp_l = (self.loss_fct(sims_wp_l * logit_scale) + self.loss_fct(sims_wp_l.T * logit_scale)) / 2.0
+        loss_self_kl_l = (self.loss_kl(sims_sf_l, sims_wp_l) + self.loss_kl(sims_sf_l, sims_wp_l.T)) / 2.0
 
         ########## Step-III: KL high & low ##########
         f_feat, p_feat = f_feat, self.get_less_patch_feat(p_feat)
         s_feat, w_feat = s_feat_h, w_feat_h
-        sims_sf = self.s_and_f(s_feat, f_feat)
+        sims_sf = self.s_and_f(s_feat, f_feat, type="sf")
         loss_sf = (self.loss_fct(sims_sf * logit_scale) + self.loss_fct(sims_sf.T * logit_scale)) / 2.0
-        sims_wp = self.w_and_p(w_feat, p_feat)
+        sims_wp = self.w_and_p(w_feat, p_feat, type="wp")
         loss_wp = (self.loss_fct(sims_wp * logit_scale) + self.loss_fct(sims_wp.T * logit_scale)) / 2.0
+        loss_self_kl = (self.loss_kl(sims_sf, sims_wp) + self.loss_kl(sims_sf, sims_wp.T)) / 2.0
 
+        ########## Step-IV: total loss ##########
         loss_kl_sf = (self.loss_kl(sims_sf, sims_sf_h) + self.loss_kl(sims_sf, sims_sf_l) +
                       self.loss_kl(sims_sf.T, sims_sf_h.T) + self.loss_kl(sims_sf.T, sims_sf_l.T)) / 4.0
         loss_kl_wp = (self.loss_kl(sims_wp, sims_wp_h) + self.loss_kl(sims_wp, sims_wp_l) +
                       self.loss_kl(sims_wp.T, sims_wp_h.T) + self.loss_kl(sims_wp.T, sims_wp_l.T)) / 4.0
 
-        total_loss = (loss_sf_h + loss_wp_h) * self.alpha + (loss_sf_l + loss_wp_l) * self.alpha + (loss_sf + loss_wp) + (loss_kl_sf + loss_kl_wp)
+        loss_kl = (loss_self_kl_h + loss_self_kl_l + loss_self_kl) / 3.0 + (loss_kl_sf + loss_kl_wp) / 2.0
+
+        total_loss = (loss_sf_h + loss_wp_h) + (loss_sf_l + loss_wp_l) + (loss_sf + loss_wp) + (loss_kl)
 
         if self.training:
             return total_loss
@@ -289,31 +293,60 @@ class Model(nn.Module):
 
         return p_feat
 
-    def s_and_f(self, s_feat, f_feat):
-        f_w = torch.softmax(self.sf_f_feat_w(f_feat).squeeze(-1), dim=-1)
-        sims_sf = torch.einsum("ad,bfd->abf", [self.norm(s_feat), self.norm(f_feat)])
-        sims_sf = torch.einsum("abf,bf->ab", [sims_sf, f_w])
+    def s_and_f(self, s_feat, f_feat, type):
+        if type == "sf_h":
+            f_feat = self.cam_sf_h(s_feat, f_feat)
+            sims_sf = torch.einsum("ad,bad->ab", [self.norm(s_feat), self.norm(f_feat)])
+        elif type == "sf_l":
+            sims_sf = torch.zeros(s_feat.size(0), s_feat.size(0), device=s_feat.device)
+            for i in range(s_feat.size(1)):
+                s_feat_ = s_feat[:, i, :]
+                f_feat_ = self.cam_sf_l(s_feat_, f_feat)
+                sim = torch.einsum("ad,bad->ab", [self.norm(s_feat_), self.norm(f_feat_)])
+                sims_sf = sims_sf + sim
+            sims_sf = sims_sf / s_feat.size(1)
+        else:
+            f_feat = self.cam_sf(s_feat, f_feat)
+            sims_sf = torch.einsum("ad,bad->ab", [self.norm(s_feat), self.norm(f_feat)])
 
         return sims_sf
 
-    def w_and_p(self, w_feat, p_feat):
-        w_w = torch.softmax(self.wp_w_feat_w(w_feat).squeeze(-1), dim=-1)
-        p_w = torch.softmax(self.wp_p_feat_w(p_feat).squeeze(-1), dim=-1)
-
-        sims_wp = torch.einsum("awd,bpd->abwp", [self.norm(w_feat), self.norm(p_feat)])
-        sims_w2p, _ = sims_wp.max(dim=-1)
-        sims_w2p = torch.einsum('abw,aw->ab', [sims_w2p, w_w])
-        sims_p2w, _ = sims_wp.max(dim=-2)
-        sims_p2w = torch.einsum('abf,bf->ab', [sims_p2w, p_w])
-        sims_wp = (sims_w2p + sims_p2w) / 2.0
+    def w_and_p(self, w_feat, p_feat, type):
+        if type == "wp_h":
+            w_w = torch.softmax(self.wp_w_feat_w_h(w_feat).squeeze(-1), dim=-1)
+            p_w = torch.softmax(self.wp_p_feat_w_h(p_feat).squeeze(-1), dim=-1)
+            sims_wp = torch.einsum("awd,bpd->abwp", [self.norm(w_feat), self.norm(p_feat)])
+            sims_w2p, _ = sims_wp.max(dim=-1)
+            sims_w2p = torch.einsum('abw,aw->ab', [sims_w2p, w_w])
+            sims_p2w, _ = sims_wp.max(dim=-2)
+            sims_p2w = torch.einsum('abf,bf->ab', [sims_p2w, p_w])
+            sims_wp = (sims_w2p + sims_p2w) / 2.0
+        elif type == "wp_l":
+            w_w = torch.softmax(self.wp_w_feat_w_l(w_feat).squeeze(-1), dim=-1)
+            p_w = torch.softmax(self.wp_p_feat_w_l(p_feat).squeeze(-1), dim=-1)
+            sims_wp = torch.einsum("awd,bpd->abwp", [self.norm(w_feat), self.norm(p_feat)])
+            sims_w2p, _ = sims_wp.max(dim=-1)
+            sims_w2p = torch.einsum('abw,aw->ab', [sims_w2p, w_w])
+            sims_p2w, _ = sims_wp.max(dim=-2)
+            sims_p2w = torch.einsum('abf,bf->ab', [sims_p2w, p_w])
+            sims_wp = (sims_w2p + sims_p2w) / 2.0
+        else:
+            w_w = torch.softmax(self.wp_w_feat_w(w_feat).squeeze(-1), dim=-1)
+            p_w = torch.softmax(self.wp_p_feat_w(p_feat).squeeze(-1), dim=-1)
+            sims_wp = torch.einsum("awd,bpd->abwp", [self.norm(w_feat), self.norm(p_feat)])
+            sims_w2p, _ = sims_wp.max(dim=-1)
+            sims_w2p = torch.einsum('abw,aw->ab', [sims_w2p, w_w])
+            sims_p2w, _ = sims_wp.max(dim=-2)
+            sims_p2w = torch.einsum('abf,bf->ab', [sims_p2w, p_w])
+            sims_wp = (sims_w2p + sims_p2w) / 2.0
 
         return sims_wp
 
     def get_similarity_logits(self, s_feat, w_feat, f_feat, p_feat):
 
         f_feat, p_feat = f_feat, self.get_less_patch_feat(p_feat)
-        sims_sf = self.s_and_f(s_feat, f_feat)
-        sims_wp = self.w_and_p(w_feat, p_feat)
+        sims_sf = self.s_and_f(s_feat, f_feat, type="sf")
+        sims_wp = self.w_and_p(w_feat, p_feat, type="wp")
         sims = (sims_sf + sims_wp) / 2.0
 
         return sims
